@@ -58,52 +58,67 @@ def require_admin():
         abort(401, description="Неверный пароль")
 
 
-def load_products():
-    if not os.path.exists(PRODUCTS_FILE):
+def _load_json(path):
+    if not os.path.exists(path):
         return []
-    with open(PRODUCTS_FILE, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _save_json(path, items):
+    # атомарная запись: файл не повредится, если процесс прервётся посреди записи
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_products():
+    return _load_json(PRODUCTS_FILE)
 
 
 def save_products(items):
-    with open(PRODUCTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    _save_json(PRODUCTS_FILE, items)
 
 
 def load_orders():
-    if not os.path.exists(ORDERS_FILE):
-        return []
-    with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json(ORDERS_FILE)
 
 
 def save_orders(items):
-    with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    _save_json(ORDERS_FILE, items)
 
 
 def load_questions():
-    if not os.path.exists(QUESTIONS_FILE):
-        return []
-    with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json(QUESTIONS_FILE)
 
 
 def save_questions(items):
-    with open(QUESTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    _save_json(QUESTIONS_FILE, items)
 
 
 def load_promos():
-    if not os.path.exists(PROMOS_FILE):
-        return []
-    with open(PROMOS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return _load_json(PROMOS_FILE)
 
 
 def save_promos(items):
-    with open(PROMOS_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    _save_json(PROMOS_FILE, items)
+
+
+# Кэш каталога для публичного API: файл перечитывается только если он изменился.
+_products_cache = {"sig": None, "data": []}
+
+
+def products_cached():
+    try:
+        st = os.stat(PRODUCTS_FILE)
+    except OSError:
+        return []
+    sig = (st.st_mtime_ns, st.st_size)
+    if _products_cache["sig"] != sig:
+        _products_cache["data"] = load_products()
+        _products_cache["sig"] = sig
+    return _products_cache["data"]
 
 
 def fmt_price(n):
@@ -123,16 +138,6 @@ def sanitize_badge(raw):
     return b if b in ALLOWED_BADGES else None
 
 
-def sanitize_old_price(raw):
-    if raw in (None, ""):
-        return None
-    try:
-        v = int(float(raw))
-    except (TypeError, ValueError):
-        return None
-    return v if v > 0 else None
-
-
 # --- Промокоды -----------------------------------------------------------
 
 def sanitize_positive_int(raw):
@@ -144,6 +149,9 @@ def sanitize_positive_int(raw):
     except (TypeError, ValueError):
         return None
     return v if v > 0 else None
+
+
+sanitize_old_price = sanitize_positive_int
 
 
 def find_promo_by_code(code):
@@ -250,6 +258,55 @@ def index():
 @app.route("/products.json", methods=["GET"])
 def products():
     return send_from_directory(APP_DIR, "products.json")
+
+
+DEFAULT_PAGE_SIZE = 12
+MAX_PAGE_SIZE = 50
+
+
+@app.route("/api/products", methods=["GET"])
+def api_products():
+    """Каталог постранично.
+    ?page=1&limit=12&category=Фарфор&sort=default|price_asc|price_desc
+    ?ids=1,2,3 — вернуть конкретные товары (для избранного), без пагинации.
+    """
+    all_items = products_cached()
+    categories = list(dict.fromkeys(p.get("category") for p in all_items if p.get("category")))
+
+    ids_raw = request.args.get("ids", "").strip()
+    if ids_raw:
+        wanted = {int(x) for x in ids_raw.split(",") if x.strip().isdigit()}
+        items = [p for p in all_items if p.get("id") in wanted][:100]
+        return jsonify({"items": items, "total": len(items), "page": 1,
+                        "has_more": False, "categories": categories})
+
+    category = request.args.get("category", "").strip()
+    items = [p for p in all_items if p.get("category") == category] if category else list(all_items)
+
+    sort = request.args.get("sort", "default")
+    if sort == "price_asc":
+        items.sort(key=lambda p: p.get("price") or 0)
+    elif sort == "price_desc":
+        items.sort(key=lambda p: p.get("price") or 0, reverse=True)
+
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+    try:
+        limit = min(MAX_PAGE_SIZE, max(1, int(request.args.get("limit", DEFAULT_PAGE_SIZE))))
+    except ValueError:
+        limit = DEFAULT_PAGE_SIZE
+
+    total = len(items)
+    chunk = items[(page - 1) * limit: page * limit]
+    return jsonify({
+        "items": chunk,
+        "total": total,
+        "page": page,
+        "has_more": page * limit < total,
+        "categories": categories,
+    })
 
 
 @app.route("/api/order", methods=["POST"])

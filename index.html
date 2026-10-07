@@ -175,6 +175,10 @@
   .skel-line{height:10px;border-radius:4px;margin-top:12px;background:linear-gradient(110deg,var(--bg-elev) 25%,var(--bg-elev-2) 50%,var(--bg-elev) 75%);background-size:300% 100%;animation:shimmer 2s ease-in-out infinite;width:70%;}
   .skel-line.short{width:45%;margin-top:7px;}
   @keyframes shimmer{0%{background-position:200% 0;}100%{background-position:-100% 0;}}
+  .grid-more{text-align:center;padding:4px 20px 32px;}
+  .load-more{min-width:180px;height:42px;border-radius:999px;border:1px solid var(--line);background:var(--bg-elev);color:var(--text);font-family:var(--font-body);font-size:13px;cursor:pointer;transition:all .25s var(--ease);}
+  .load-more:active{transform:scale(.96);}
+  .load-more.loading{opacity:.5;pointer-events:none;}
   .empty-state{grid-column:1/-1;text-align:center;padding:70px 20px;color:var(--muted);font-size:14px;line-height:1.6;}
   .empty-state svg{opacity:.4;margin-bottom:16px;animation:floatIcon 3s ease-in-out infinite;}
   @keyframes floatIcon{0%,100%{transform:translateY(0);}50%{transform:translateY(-8px);}}
@@ -413,6 +417,9 @@
   <div id="gridWrap">
     <div class="skeleton-grid" id="skeletonGrid"></div>
     <div class="grid" id="grid" style="display:none;"></div>
+    <div id="gridMore" class="grid-more" style="display:none;">
+      <button class="load-more" id="loadMoreBtn">Показать ещё</button>
+    </div>
   </div>
 </div>
 
@@ -616,7 +623,8 @@ const firstImage = p => (p.images && p.images.length) ? p.images[0] : (p.image |
 const slideBg = (url, p) => url ? `background-image:url('${url}');background-size:cover;background-position:center;` : `background:${SWATCHES[p.swatch % SWATCHES.length]};`;
 const media = p => slideBg(firstImage(p), p);
 
-let PRODUCTS = [];
+let PRODUCTS = [];      // кэш уже загруженных товаров (по мере подгрузки страниц)
+let CATEGORIES = [];
 let cart = [];
 let appliedPromo = null; // { code, type, value }
 let promoFormOpen = false;
@@ -714,7 +722,7 @@ function renderTicker(){
 }
 
 function renderFilters(){
-  const cats = ['Все', ...new Set(PRODUCTS.map(p => p.category))];
+  const cats = ['Все', ...CATEGORIES];
   filtersEl.innerHTML = cats.map(c =>
     `<button class="chip ${c===activeCategory?'active':''}" data-cat="${c}">${c}</button>`
   ).join('');
@@ -789,13 +797,6 @@ function attachCardHandlers(container){
   });
 }
 
-function applySort(list){
-  const sorted = list.slice();
-  if (sortMode==='price_asc') sorted.sort((a,b)=>a.price-b.price);
-  else if (sortMode==='price_desc') sorted.sort((a,b)=>b.price-a.price);
-  return sorted;
-}
-
 const sortBtn = document.getElementById('sortBtn');
 const sortMenu = document.getElementById('sortMenu');
 sortBtn.onclick = (e) => {
@@ -815,25 +816,87 @@ sortMenu.querySelectorAll('.sort-opt').forEach(opt=>{
   };
 });
 
-function renderGrid(){
-  let list = activeCategory==='Все' ? PRODUCTS : PRODUCTS.filter(p=>p.category===activeCategory);
-  list = applySort(list);
-  grid.style.opacity = '0';
-  grid.style.transform = 'translateY(6px)';
-  setTimeout(()=>{
-    if (list.length===0){
-      grid.innerHTML = emptyStateHTML;
-    } else {
-      grid.innerHTML = list.map((p,i) => cardHTML(p,i)).join('');
-      attachCardHandlers(grid);
-    }
-    grid.style.opacity = '1';
-    grid.style.transform = 'translateY(0)';
-  }, 140);
+// --- постраничная подгрузка каталога ------------------------------------
+const PAGE_SIZE = 12;
+let gridPage = 0, gridHasMore = false, gridLoading = false, gridToken = 0;
+const gridMore = document.getElementById('gridMore');
+const loadMoreBtn = document.getElementById('loadMoreBtn');
+
+function mergeProducts(items){
+  items.forEach(p => {
+    const i = PRODUCTS.findIndex(x => x.id === p.id);
+    if (i >= 0) PRODUCTS[i] = p; else PRODUCTS.push(p);
+  });
 }
 
-function renderFavorites(){
+async function loadGridPage(reset){
+  if (reset){ gridToken++; gridPage = 0; gridHasMore = false; }
+  else if (gridLoading || !gridHasMore) return;
+  const token = gridToken;
+  gridLoading = true;
+  loadMoreBtn.classList.add('loading');
+  try {
+    const qs = new URLSearchParams({ page: gridPage + 1, limit: PAGE_SIZE, sort: sortMode });
+    if (activeCategory !== 'Все') qs.set('category', activeCategory);
+    const r = await fetch('/api/products?' + qs);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    if (token !== gridToken) return; // устаревший ответ (сменили категорию/сортировку)
+    CATEGORIES = data.categories || [];
+    mergeProducts(data.items);
+    gridPage = data.page;
+    gridHasMore = data.has_more;
+    if (reset) grid.innerHTML = '';
+    if (!data.items.length && reset){
+      grid.innerHTML = emptyStateHTML;
+    } else {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = data.items.map((p,i) => cardHTML(p,i)).join('');
+      attachCardHandlers(tmp);
+      while (tmp.firstChild) grid.appendChild(tmp.firstChild);
+    }
+  } catch(e){
+    if (token === gridToken && reset) grid.innerHTML = emptyStateHTML;
+    else if (token === gridToken) showToast('Не удалось загрузить товары', 'error');
+  } finally {
+    if (token === gridToken){
+      gridLoading = false;
+      loadMoreBtn.classList.remove('loading');
+      gridMore.style.display = gridHasMore ? '' : 'none';
+      setTimeout(() => { observeReveals(); initTiltEffect(); fillViewport(); }, 50);
+    }
+  }
+}
+
+// если страница короткая и «Показать ещё» уже на экране — сразу подгружаем следующую
+function fillViewport(){
+  if (!gridHasMore || gridLoading) return;
+  if (gridMore.getBoundingClientRect().top < window.innerHeight + 300) loadGridPage(false);
+}
+
+loadMoreBtn.onclick = () => loadGridPage(false);
+new IntersectionObserver(es => {
+  if (es[0].isIntersecting) loadGridPage(false);
+}, { rootMargin: '400px' }).observe(gridMore);
+
+function renderGrid(){
+  grid.style.opacity = '0';
+  grid.style.transform = 'translateY(6px)';
+  return loadGridPage(true).then(() => {
+    grid.style.opacity = '1';
+    grid.style.transform = 'translateY(0)';
+  });
+}
+
+async function renderFavorites(){
   const favGrid = document.getElementById('favGrid');
+  const missing = [...favorites].filter(id => !PRODUCTS.some(p => p.id === id));
+  if (missing.length){
+    try {
+      const r = await fetch('/api/products?ids=' + missing.join(','));
+      if (r.ok) mergeProducts((await r.json()).items);
+    } catch(e){}
+  }
   const list = PRODUCTS.filter(p=>favorites.has(p.id));
   if (list.length===0){
     favGrid.innerHTML = `<div class="favs-empty">
@@ -1517,17 +1580,11 @@ document.querySelectorAll('.sheet').forEach(sheet=>{
 
 updateFavBadge();
 
-fetch('products.json').then(r=>r.json()).then(data=>{
-  PRODUCTS = data;
-  renderTicker();
+renderTicker();
+loadGridPage(true).then(() => {
   renderFilters();
-  renderGrid();
   skeletonGrid.style.display = 'none';
   grid.style.display = 'grid';
-}).catch(()=>{
-  skeletonGrid.style.display = 'none';
-  grid.style.display = 'grid';
-  grid.innerHTML = emptyStateHTML;
 });
 
 
@@ -1558,7 +1615,8 @@ function observeReveals() {
 // --- Enhanced card tilt effect on mouse move (desktop) ---
 function initTiltEffect() {
   if (window.matchMedia('(pointer: coarse)').matches) return;
-  document.querySelectorAll('.card').forEach(card => {
+  document.querySelectorAll('.card:not([data-tilt])').forEach(card => {
+    card.dataset.tilt = '1';
     card.addEventListener('mousemove', (e) => {
       const rect = card.getBoundingClientRect();
       const x = e.clientX - rect.left;
@@ -1578,15 +1636,14 @@ function initTiltEffect() {
 // Override renderGrid to add reveals and tilt
 const originalRenderGrid = renderGrid;
 renderGrid = function() {
-  originalRenderGrid();
-  setTimeout(() => { observeReveals(); initTiltEffect(); }, 200);
+  return originalRenderGrid();
 };
 
 // Override renderFavorites to add reveals
 const originalRenderFavs = renderFavorites;
-renderFavorites = function() {
-  originalRenderFavs();
-  setTimeout(() => { observeReveals(); initTiltEffect(); }, 200);
+renderFavorites = async function() {
+  await originalRenderFavs();
+  setTimeout(() => { observeReveals(); initTiltEffect(); }, 100);
 };
 
 // Override renderOrders to add reveals
